@@ -7,3 +7,8 @@ __pycache__/
 !requirements.txt
 node_modules/
 package-lock.json
+
+# Ignore all source scripts except the compiler itself
+*.js
+*.py
+!compile_script.py
