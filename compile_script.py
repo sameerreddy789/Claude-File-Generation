@@ -4,26 +4,27 @@ import re
 import subprocess
 import tempfile
 
-def patch_js_code(content, workspace_dir):
-    # Redirect mnt paths to the local workspace directory
+def redirect_paths(content, workspace_dir):
     workspace_dir_clean = workspace_dir.replace('\\', '/')
     
-    # Matches "/mnt/user-data/outputs/filename.ext" or "/mnt/user-data/filename.ext"
-    content = re.sub(r'["\']/mnt/user-data/outputs/([^"\']+)["\']', 
-                     f'"{workspace_dir_clean}/\\1"', content)
-    content = re.sub(r'["\']/mnt/user-data/([^"\']+)["\']', 
-                     f'"{workspace_dir_clean}/\\1"', content)
+    # Matches "/mnt/user-data/outputs/...", "/mnt/user-data/...", "/home/claude/...", "/home/user/...", "/tmp/..."
+    patterns = [
+        r'["\']/mnt/user-data/outputs/([^"\']+)["\']',
+        r'["\']/mnt/user-data/([^"\']+)["\']',
+        r'["\']/home/claude/([^"\']+)["\']',
+        r'["\']/home/user/([^"\']+)["\']',
+        r'["\']/tmp/([^"\']+)["\']',
+    ]
+    for pattern in patterns:
+        content = re.sub(pattern, f'"{workspace_dir_clean}/\\1"', content)
     return content
 
+def patch_js_code(content, workspace_dir):
+    return redirect_paths(content, workspace_dir)
+
 def patch_code(content, workspace_dir):
-    # 1. Redirect mnt paths to the local workspace directory
-    workspace_dir_clean = workspace_dir.replace('\\', '/')
-    
-    # Matches "/mnt/user-data/outputs/filename.ext" or "/mnt/user-data/filename.ext"
-    content = re.sub(r'["\']/mnt/user-data/outputs/([^"\']+)["\']', 
-                     f'"{workspace_dir_clean}/\\1"', content)
-    content = re.sub(r'["\']/mnt/user-data/([^"\']+)["\']', 
-                     f'"{workspace_dir_clean}/\\1"', content)
+    # 1. Redirect paths
+    content = redirect_paths(content, workspace_dir)
     
     # 2. Swap thickness and color in ReportLab TableStyle line commands
     # Matches patterns like ('LINEBEFORE', (0,0), (0,-1), C_ACCENT, 5) and swaps to 5, C_ACCENT
@@ -38,7 +39,6 @@ def patch_code(content, workspace_dir):
     content = re.sub(pattern_lineafter_false, "", content)
 
     # 4. Inject KeepTogether setStyle monkey-patch
-    # This solves the story[-1].setStyle(...) crash by delegating setStyle to the Table inside KeepTogether.
     monkey_patch = """
 # --- AUTOMATIC ANTIGRAVITY MONKEY-PATCH FOR KEEPTOGETHER SETSTYLE ---
 try:
@@ -55,10 +55,59 @@ except ImportError:
     pass
 # ---------------------------------------------------------------------
 """
-    # Insert it right after the imports or at the very beginning of the script
     content = monkey_patch + "\n" + content
 
     return content
+
+def check_and_install_node_deps(code_content, workspace_dir):
+    # Find all require statement packages
+    requires = re.findall(r'require\([\'"]([^\'"]+)[\'"]\)', code_content)
+    
+    # Standard Node.js built-ins to ignore
+    builtins = {
+        'fs', 'path', 'child_process', 'os', 'http', 'https', 'util', 'crypto', 
+        'stream', 'events', 'readline', 'dns', 'net', 'tls', 'zlib', 'url', 
+        'querystring', 'punycode', 'assert', 'buffer', 'constants', 'module'
+    }
+    
+    external_packages = []
+    for pkg in requires:
+        if pkg not in builtins and not pkg.startswith('.') and not pkg.startswith('/') and not pkg.startswith('\\'):
+            # Extract base package name (e.g. "react-icons/fa" -> "react-icons")
+            base_pkg = pkg.split('/')[0]
+            if base_pkg not in external_packages:
+                external_packages.append(base_pkg)
+                
+    if not external_packages:
+        return
+        
+    print(f"Detected external npm dependencies: {', '.join(external_packages)}")
+    
+    for pkg in external_packages:
+        print(f"Checking if '{pkg}' is installed...")
+        # Check using Node's module resolution (exits with 0 if found)
+        check_res = subprocess.run(
+            ["node", "-e", f"require('{pkg}')"], 
+            cwd=workspace_dir, 
+            capture_output=True, 
+            text=True
+        )
+        if check_res.returncode != 0:
+            print(f"npm package '{pkg}' is missing. Installing it...")
+            install_res = subprocess.run(
+                f"npm install {pkg}", 
+                cwd=workspace_dir, 
+                shell=True, 
+                capture_output=True, 
+                text=True
+            )
+            if install_res.returncode == 0:
+                print(f"Successfully installed '{pkg}'.")
+            else:
+                print(f"Error installing '{pkg}':\n{install_res.stderr}")
+                sys.exit(1)
+        else:
+            print(f"'{pkg}' is already installed.")
 
 def main():
     if len(sys.argv) < 2:
@@ -70,7 +119,6 @@ def main():
         print(f"Error: Script not found at {input_script}")
         sys.exit(1)
 
-    # Use the active workspace doc folder as output dir
     workspace_dir = os.path.dirname(os.path.abspath(__file__))
     _, ext = os.path.splitext(input_script)
     
@@ -80,20 +128,12 @@ def main():
 
     if ext.lower() == '.js':
         print("Detected JavaScript (Node.js) script.")
+        
+        # Auto-check and install any missing npm dependencies
+        check_and_install_node_deps(code_content, workspace_dir)
+        
         print("Applying path patches...")
         patched_code = patch_js_code(code_content, workspace_dir)
-        
-        # Check Node.js dependencies
-        node_modules_docx = os.path.join(workspace_dir, "node_modules", "docx")
-        if not os.path.exists(node_modules_docx):
-            print("Required 'docx' npm package is not installed. Installing it now...")
-            # Run npm install docx (shell=True is required on Windows for npm)
-            install_res = subprocess.run("npm install docx", cwd=workspace_dir, shell=True, capture_output=True, text=True)
-            if install_res.returncode == 0:
-                print("Successfully installed 'docx' npm package.")
-            else:
-                print(f"Error installing dependencies:\n{install_res.stderr}")
-                sys.exit(1)
         
         # Create temp JS file
         temp_fd, temp_path = tempfile.mkstemp(suffix='.js', dir=workspace_dir)
@@ -127,7 +167,6 @@ def main():
         patched_code = patch_code(code_content, workspace_dir)
 
         # Create a temporary file to run the patched script
-        # We create it in the workspace so relative imports or virtual env paths resolve correctly
         temp_fd, temp_path = tempfile.mkstemp(suffix='.py', dir=workspace_dir)
         os.close(temp_fd)
 
@@ -136,14 +175,10 @@ def main():
                 f.write(patched_code)
 
             print(f"Executing patched code using virtual environment...")
-            
-            # Path to virtual env python
             python_exe = os.path.join(workspace_dir, ".venv", "Scripts", "python.exe")
             if not os.path.exists(python_exe):
-                # Fallback to system python if venv python isn't found
                 python_exe = sys.executable
 
-            # Run the temporary script
             result = subprocess.run([python_exe, temp_path], capture_output=True, text=True, cwd=workspace_dir)
 
             if result.returncode == 0:
@@ -158,7 +193,6 @@ def main():
                 sys.exit(result.returncode)
 
         finally:
-            # Clean up the temporary file
             if os.path.exists(temp_path):
                 os.remove(temp_path)
 
