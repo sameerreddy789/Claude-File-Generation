@@ -4,6 +4,17 @@ import re
 import subprocess
 import tempfile
 
+def patch_js_code(content, workspace_dir):
+    # Redirect mnt paths to the local workspace directory
+    workspace_dir_clean = workspace_dir.replace('\\', '/')
+    
+    # Matches "/mnt/user-data/outputs/filename.ext" or "/mnt/user-data/filename.ext"
+    content = re.sub(r'["\']/mnt/user-data/outputs/([^"\']+)["\']', 
+                     f'"{workspace_dir_clean}/\\1"', content)
+    content = re.sub(r'["\']/mnt/user-data/([^"\']+)["\']', 
+                     f'"{workspace_dir_clean}/\\1"', content)
+    return content
+
 def patch_code(content, workspace_dir):
     # 1. Redirect mnt paths to the local workspace directory
     workspace_dir_clean = workspace_dir.replace('\\', '/')
@@ -61,49 +72,95 @@ def main():
 
     # Use the active workspace doc folder as output dir
     workspace_dir = os.path.dirname(os.path.abspath(__file__))
+    _, ext = os.path.splitext(input_script)
     
     print(f"Reading target script: {input_script}...")
     with open(input_script, 'r', encoding='utf-8') as f:
         code_content = f.read()
 
-    print("Applying patches...")
-    patched_code = patch_code(code_content, workspace_dir)
-
-    # Create a temporary file to run the patched script
-    # We create it in the workspace so relative imports or virtual env paths resolve correctly
-    temp_fd, temp_path = tempfile.mkstemp(suffix='.py', dir=workspace_dir)
-    os.close(temp_fd)
-
-    try:
-        with open(temp_path, 'w', encoding='utf-8') as f:
-            f.write(patched_code)
-
-        print(f"Executing patched code using virtual environment...")
+    if ext.lower() == '.js':
+        print("Detected JavaScript (Node.js) script.")
+        print("Applying path patches...")
+        patched_code = patch_js_code(code_content, workspace_dir)
         
-        # Path to virtual env python
-        python_exe = os.path.join(workspace_dir, ".venv", "Scripts", "python.exe")
-        if not os.path.exists(python_exe):
-            # Fallback to system python if venv python isn't found
-            python_exe = sys.executable
+        # Check Node.js dependencies
+        node_modules_docx = os.path.join(workspace_dir, "node_modules", "docx")
+        if not os.path.exists(node_modules_docx):
+            print("Required 'docx' npm package is not installed. Installing it now...")
+            # Run npm install docx (shell=True is required on Windows for npm)
+            install_res = subprocess.run("npm install docx", cwd=workspace_dir, shell=True, capture_output=True, text=True)
+            if install_res.returncode == 0:
+                print("Successfully installed 'docx' npm package.")
+            else:
+                print(f"Error installing dependencies:\n{install_res.stderr}")
+                sys.exit(1)
+        
+        # Create temp JS file
+        temp_fd, temp_path = tempfile.mkstemp(suffix='.js', dir=workspace_dir)
+        os.close(temp_fd)
+        
+        try:
+            with open(temp_path, 'w', encoding='utf-8') as f:
+                f.write(patched_code)
+                
+            print("Executing script using Node.js...")
+            result = subprocess.run(["node", temp_path], capture_output=True, text=True, cwd=workspace_dir)
+            
+            if result.returncode == 0:
+                print("\n[SUCCESS] Output details:")
+                print(result.stdout)
+            else:
+                print("\n[ERROR] Error executing script:")
+                print("--- Standard Output ---")
+                print(result.stdout)
+                print("--- Error Output ---")
+                print(result.stderr)
+                sys.exit(result.returncode)
+        finally:
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+                
+    else:
+        # Assume Python script
+        print("Detected Python script.")
+        print("Applying ReportLab and path patches...")
+        patched_code = patch_code(code_content, workspace_dir)
 
-        # Run the temporary script
-        result = subprocess.run([python_exe, temp_path], capture_output=True, text=True)
+        # Create a temporary file to run the patched script
+        # We create it in the workspace so relative imports or virtual env paths resolve correctly
+        temp_fd, temp_path = tempfile.mkstemp(suffix='.py', dir=workspace_dir)
+        os.close(temp_fd)
 
-        if result.returncode == 0:
-            print("\n[SUCCESS] Output details:")
-            print(result.stdout)
-        else:
-            print("\n[ERROR] Error executing script:")
-            print("--- Standard Output ---")
-            print(result.stdout)
-            print("--- Error Output ---")
-            print(result.stderr)
-            sys.exit(result.returncode)
+        try:
+            with open(temp_path, 'w', encoding='utf-8') as f:
+                f.write(patched_code)
 
-    finally:
-        # Clean up the temporary file
-        if os.path.exists(temp_path):
-            os.remove(temp_path)
+            print(f"Executing patched code using virtual environment...")
+            
+            # Path to virtual env python
+            python_exe = os.path.join(workspace_dir, ".venv", "Scripts", "python.exe")
+            if not os.path.exists(python_exe):
+                # Fallback to system python if venv python isn't found
+                python_exe = sys.executable
+
+            # Run the temporary script
+            result = subprocess.run([python_exe, temp_path], capture_output=True, text=True, cwd=workspace_dir)
+
+            if result.returncode == 0:
+                print("\n[SUCCESS] Output details:")
+                print(result.stdout)
+            else:
+                print("\n[ERROR] Error executing script:")
+                print("--- Standard Output ---")
+                print(result.stdout)
+                print("--- Error Output ---")
+                print(result.stderr)
+                sys.exit(result.returncode)
+
+        finally:
+            # Clean up the temporary file
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
 
 if __name__ == '__main__':
     main()
